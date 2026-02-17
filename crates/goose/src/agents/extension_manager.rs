@@ -228,7 +228,18 @@ async fn child_process_client(
         command.env("PATH", path);
     }
 
-    if let Some(dir) = working_dir {
+    // Set GOOSE_CONTEXT_SIZE env var for the child process from provider's model config
+    if let Some(provider_arc) = provider.lock().await.as_ref() {
+        let context_limit = provider_arc.get_model_config().context_limit();
+        command.env("GOOSE_CONTEXT_SIZE", context_limit.to_string());
+    }
+
+    // Use explicitly passed working_dir, falling back to GOOSE_WORKING_DIR env var
+    let effective_working_dir = working_dir
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::var("GOOSE_WORKING_DIR").ok().map(PathBuf::from));
+
+    if let Some(ref dir) = effective_working_dir {
         if dir.exists() && dir.is_dir() {
             tracing::info!("Setting MCP process working directory: {:?}", dir);
             command.current_dir(dir);
@@ -646,6 +657,7 @@ impl ExtensionManager {
                     })?;
                 let mut context = self.context.clone();
                 context.extension_manager = Some(Arc::downgrade(self));
+
                 (def.client_factory)(context)
             }
             ExtensionConfig::InlinePython {
@@ -1509,6 +1521,14 @@ impl ExtensionManager {
         session_id: &str,
         working_dir: &std::path::Path,
     ) -> Option<String> {
+        if let Ok(provider_guard) = self.provider.try_lock() {
+            if let Some(provider) = provider_guard.as_ref() {
+                if provider.get_model_config().context_limit() < 9 * 1024 * 1024 {
+                    return None;
+                }
+            }
+        }
+
         // Use minute-level granularity to prevent conversation changes every second
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:00").to_string();
         let mut content = format!(
